@@ -1,0 +1,21 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+uv.lock
+
+# Airflow
+airflow_home/airflow.db
+airflow_home/logs/
+airflow_home/*.pid
+airflow_home/webserver_config.py
+airflow_home/simple_auth_manager_passwords.json*
+
+# Data (don't commit personal health data!)
+data/exports/
+data/processed/
+
+# OS
+.DS_Store
+Thumbs.db
