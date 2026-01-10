@@ -1,0 +1,452 @@
+from datetime import datetime, timedelta
+from pathlib import Path
+import pandas as pd
+from airflow import DAG
+from airflow.operators.python import PythonOperator
+from airflow.providers.postgres.operators.postgres import PostgresOperator
+from airflow.providers.postgres.hooks.postgres import PostgresHook
+from airflow.sensors.filesystem import FileSensor
+
+def task_failure_alert(context):
+    """Called when a task fails."""
+    task_instance = context['task_instance']
+    dag_id = context['dag'].dag_id
+    task_id = context['task'].task_id
+    exception = context.get('exception')
+    log_url = context.get('task_instance').log_url
+    
+    print("\n" + "="*60)
+    print("❌ TASK FAILED")
+    print("="*60)
+    print(f"DAG: {dag_id}")
+    print(f"Task: {task_id}")
+    print(f"Exception: {exception}")
+    print(f"Log URL: {log_url}")
+    print("="*60 + "\n")
+
+
+def task_retry_alert(context):
+    """Called when a task is retrying."""
+    task_instance = context['task_instance']
+    print(f"\n⚠️  RETRYING: {task_instance.task_id} (attempt {task_instance.try_number})\n")
+
+
+def task_success_alert(context):
+    """Called when a task succeeds (useful after retries)."""
+    task_instance = context['task_instance']
+    if task_instance.try_number > 1:
+        print(f"\n✅ RECOVERED: {task_instance.task_id} succeeded after {task_instance.try_number} attempts\n")
+
+# Configuration
+PROJECT_DIR = Path(__file__).parent.parent
+MYFITNESSPAL_DIR = PROJECT_DIR / "data" / "exports" / "myfitnesspal"
+GARMIN_DIR = PROJECT_DIR / "data" / "exports" / "garmin"
+PROCESSED_DIR = PROJECT_DIR / "data" / "processed"
+PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
+
+default_args = {
+    'owner': 'brook',
+    'depends_on_past': False,
+    'start_date': datetime(2025, 10, 1),
+    'email_on_failure': False,
+    'email_on_retry': False,
+    'retries': 2,  # Increased from 1 to 2
+    'retry_delay': timedelta(minutes=5),
+    'retry_exponential_backoff': True,  # Wait longer each retry
+    'max_retry_delay': timedelta(minutes=30),  # Cap retry delay
+    'on_failure_callback': task_failure_alert,
+    'on_retry_callback': task_retry_alert,
+    'on_success_callback': task_success_alert,
+}
+
+def extract_nutrition_data(**context):
+    """Extract MyFitnessPal nutrition data from CSV."""
+    try:
+        csv_files = list(MYFITNESSPAL_DIR.glob("*.csv"))
+        
+        if not csv_files:
+            raise FileNotFoundError(f"No MyFitnessPal CSV files found in {MYFITNESSPAL_DIR}")
+        
+        # Get the most recent file
+        latest_file = max(csv_files, key=lambda p: p.stat().st_mtime)
+        print(f"Processing nutrition file: {latest_file}")
+        
+        # Read CSV with validation
+        df = pd.read_csv(latest_file)
+        
+        # Validate required columns exist
+        required_cols = ['Date', 'Meal', 'Calories', 'Protein (g)', 'Carbohydrates (g)', 'Fat (g)']
+        missing_cols = [col for col in required_cols if col not in df.columns]
+        if missing_cols:
+            raise ValueError(f"Missing required columns: {missing_cols}. Found columns: {df.columns.tolist()}")
+        
+        # Convert Date column to datetime
+        df['Date'] = pd.to_datetime(df['Date'], errors='coerce')
+        
+        # Check for invalid dates
+        invalid_dates = df['Date'].isna().sum()
+        if invalid_dates > 0:
+            print(f"⚠️  WARNING: Found {invalid_dates} rows with invalid dates (will be skipped)")
+            df = df.dropna(subset=['Date'])
+        
+        if len(df) == 0:
+            raise ValueError("No valid data after date parsing")
+        
+        # Data quality checks
+        print(f"Loaded {len(df)} nutrition records")
+        print(f"Date range: {df['Date'].min()} to {df['Date'].max()}")
+        print(f"Meals: {df['Meal'].value_counts().to_dict()}")
+        
+        # Store in XCom for next task
+        output_path = PROCESSED_DIR / f"nutrition_{datetime.now().strftime('%Y%m%d_%H%M%S')}.parquet"
+        df.to_parquet(output_path, index=False)
+        context['ti'].xcom_push(key='nutrition_file', value=str(output_path))
+        
+        return len(df)
+        
+    except FileNotFoundError as e:
+        print(f"❌ File Error: {e}")
+        raise  # Re-raise to mark task as failed
+    except pd.errors.ParserError as e:
+        print(f"❌ CSV Parsing Error: {e}")
+        print(f"File may be corrupted or wrong format: {latest_file}")
+        raise
+    except ValueError as e:
+        print(f"❌ Validation Error: {e}")
+        raise
+    except Exception as e:
+        print(f"❌ Unexpected Error in extract_nutrition_data: {type(e).__name__}: {e}")
+        raise
+
+def extract_activity_data(**context):
+    """Extract Garmin activity data from CSV."""
+    try:
+        csv_files = list(GARMIN_DIR.glob("*.csv"))
+        
+        if not csv_files:
+            raise FileNotFoundError(f"No Garmin CSV files found in {GARMIN_DIR}")
+        
+        # Get the most recent file
+        latest_file = max(csv_files, key=lambda p: p.stat().st_mtime)
+        print(f"Processing activity file: {latest_file}")
+        
+        # Read CSV
+        df = pd.read_csv(latest_file)
+        
+        # Validate required columns
+        required_cols = ['Activity Type', 'Date', 'Calories']
+        missing_cols = [col for col in required_cols if col not in df.columns]
+        if missing_cols:
+            raise ValueError(f"Missing required columns: {missing_cols}. Found columns: {df.columns.tolist()}")
+        
+        # Convert Date column to datetime
+        df['Date'] = pd.to_datetime(df['Date'], errors='coerce')
+        
+        # Check for invalid dates
+        invalid_dates = df['Date'].isna().sum()
+        if invalid_dates > 0:
+            print(f"⚠️  WARNING: Found {invalid_dates} rows with invalid dates (will be skipped)")
+            df = df.dropna(subset=['Date'])
+        
+        if len(df) == 0:
+            raise ValueError("No valid data after date parsing")
+        
+        # Clean numeric columns (remove commas from numbers like "2,150")
+        numeric_cols = ['Distance', 'Calories', 'Steps']
+        for col in numeric_cols:
+            if col in df.columns:
+                df[col] = df[col].astype(str).str.replace(',', '').replace('--', pd.NA)
+                df[col] = pd.to_numeric(df[col], errors='coerce')
+        
+        # Data quality checks
+        print(f"Loaded {len(df)} activity records")
+        print(f"Date range: {df['Date'].min()} to {df['Date'].max()}")
+        print(f"Activity types: {df['Activity Type'].value_counts().to_dict()}")
+        
+        # Store in XCom for next task
+        output_path = PROCESSED_DIR / f"activities_{datetime.now().strftime('%Y%m%d_%H%M%S')}.parquet"
+        df.to_parquet(output_path, index=False)
+        context['ti'].xcom_push(key='activity_file', value=str(output_path))
+        
+        return len(df)
+        
+    except FileNotFoundError as e:
+        print(f"❌ File Error: {e}")
+        raise
+    except pd.errors.ParserError as e:
+        print(f"❌ CSV Parsing Error: {e}")
+        print(f"File may be corrupted or wrong format: {latest_file}")
+        raise
+    except ValueError as e:
+        print(f"❌ Validation Error: {e}")
+        raise
+    except Exception as e:
+        print(f"❌ Unexpected Error in extract_activity_data: {type(e).__name__}: {e}")
+        raise
+
+def transform_nutrition_data(**context):
+    """Aggregate nutrition data by day."""
+    nutrition_file = context['ti'].xcom_pull(task_ids='extract_nutrition', key='nutrition_file')
+    df = pd.read_parquet(nutrition_file)
+    
+    # Group by date and sum all numeric columns
+    daily_nutrition = df.groupby('Date').agg({
+        'Calories': 'sum',
+        'Fat (g)': 'sum',
+        'Carbohydrates (g)': 'sum',
+        'Protein (g)': 'sum',
+        'Fiber': 'sum',
+        'Sugar': 'sum',
+        'Sodium (mg)': 'sum',
+    }).reset_index()
+    
+    # Add meal counts
+    meal_counts = df.groupby('Date')['Meal'].count().rename('meal_count')
+    daily_nutrition = daily_nutrition.merge(meal_counts, on='Date', how='left')
+    
+    print(f"Aggregated {len(daily_nutrition)} daily nutrition summaries")
+    print(daily_nutrition.head())
+    
+    # Store for loading
+    output_path = PROCESSED_DIR / f"daily_nutrition_{datetime.now().strftime('%Y%m%d_%H%M%S')}.parquet"
+    daily_nutrition.to_parquet(output_path, index=False)
+    context['ti'].xcom_push(key='daily_nutrition_file', value=str(output_path))
+    
+    return len(daily_nutrition)
+
+
+def transform_activity_data(**context):
+    """Aggregate activity data by day."""
+    activity_file = context['ti'].xcom_pull(task_ids='extract_activities', key='activity_file')
+    df = pd.read_parquet(activity_file)
+    
+    # Group by date and activity type
+    daily_activities = df.groupby(['Date', 'Activity Type']).agg({
+        'Distance': 'sum',
+        'Calories': 'sum',
+        'Time': 'count',  # Count of activities
+        'Steps': 'sum',
+    }).reset_index()
+    
+    # Pivot to get activity types as columns
+    activity_summary = df.groupby('Date').agg({
+        'Calories': 'sum',
+        'Distance': 'sum',
+        'Steps': 'sum',
+    }).reset_index()
+    
+    # Add activity counts
+    activity_counts = df.groupby('Date')['Activity Type'].count().rename('activity_count')
+    activity_summary = activity_summary.merge(activity_counts, on='Date', how='left')
+    
+    print(f"Aggregated {len(activity_summary)} daily activity summaries")
+    print(activity_summary.head())
+    
+    # Store for loading
+    output_path = PROCESSED_DIR / f"daily_activities_{datetime.now().strftime('%Y%m%d_%H%M%S')}.parquet"
+    activity_summary.to_parquet(output_path, index=False)
+    context['ti'].xcom_push(key='daily_activity_file', value=str(output_path))
+    
+    return len(activity_summary)
+
+
+def load_daily_summaries(**context):
+    """Load daily nutrition and activity summaries into PostgreSQL."""
+    nutrition_file = context['ti'].xcom_pull(task_ids='transform_nutrition', key='daily_nutrition_file')
+    activity_file = context['ti'].xcom_pull(task_ids='transform_activities', key='daily_activity_file')
+    
+    nutrition_df = pd.read_parquet(nutrition_file)
+    activity_df = pd.read_parquet(activity_file)
+    
+    # Merge on date
+    daily_summary = nutrition_df.merge(
+        activity_df,
+        on='Date',
+        how='outer',
+        suffixes=('_nutrition', '_activity')
+    )
+    
+    # Calculate net calories (intake - burned)
+    daily_summary = daily_summary.rename(columns={
+        'Calories_nutrition': 'calories_intake',
+        'Calories_activity': 'calories_burned',
+    })
+    
+    daily_summary['net_calories'] = (
+        daily_summary['calories_intake'].fillna(0) - 
+        daily_summary['calories_burned'].fillna(0)
+    )
+    
+    print(f"Merged daily summary: {len(daily_summary)} days")
+    print(daily_summary.head())
+    
+    # Load to PostgreSQL with UPSERT logic
+    hook = PostgresHook(postgres_conn_id='health_db')
+    
+    # Convert date to string for PostgreSQL
+    daily_summary['date_str'] = daily_summary['Date'].dt.strftime('%Y-%m-%d')
+    
+    # Insert row by row with ON CONFLICT handling
+    inserted = 0
+    updated = 0
+    
+    for _, row in daily_summary.iterrows():
+        result = hook.run("""
+            INSERT INTO daily_health_summary (
+                date, calories_intake, "Fat (g)", "Carbohydrates (g)", 
+                "Protein (g)", "Fiber", "Sugar", "Sodium (mg)",
+                meal_count, calories_burned, distance, steps, 
+                activity_count, net_calories
+            ) VALUES (
+                %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
+            )
+            ON CONFLICT (date) DO UPDATE SET
+                calories_intake = EXCLUDED.calories_intake,
+                "Fat (g)" = EXCLUDED."Fat (g)",
+                "Carbohydrates (g)" = EXCLUDED."Carbohydrates (g)",
+                "Protein (g)" = EXCLUDED."Protein (g)",
+                "Fiber" = EXCLUDED."Fiber",
+                "Sugar" = EXCLUDED."Sugar",
+                "Sodium (mg)" = EXCLUDED."Sodium (mg)",
+                meal_count = EXCLUDED.meal_count,
+                calories_burned = EXCLUDED.calories_burned,
+                distance = EXCLUDED.distance,
+                steps = EXCLUDED.steps,
+                activity_count = EXCLUDED.activity_count,
+                net_calories = EXCLUDED.net_calories,
+                created_at = CURRENT_TIMESTAMP
+            RETURNING (xmax = 0) AS inserted;
+        """, parameters=(
+            row['date_str'],
+            row.get('calories_intake'),
+            row.get('Fat (g)'),
+            row.get('Carbohydrates (g)'),
+            row.get('Protein (g)'),
+            row.get('Fiber'),
+            row.get('Sugar'),
+            row.get('Sodium (mg)'),
+            row.get('meal_count'),
+            row.get('calories_burned'),
+            row.get('distance'),
+            row.get('steps'),
+            row.get('activity_count'),
+            row.get('net_calories'),
+        ), handler=lambda cur: cur.fetchone())
+        
+        if result and result[0]:
+            inserted += 1
+        else:
+            updated += 1
+    
+    print(f"Loaded {inserted} new records, updated {updated} existing records")
+    return {'inserted': inserted, 'updated': updated}
+
+def check_data_quality(**context):
+    """Run data quality checks on the processed data."""
+    hook = PostgresHook(postgres_conn_id='health_db')
+    
+    # Check for recent data
+    result = hook.get_first("""
+        SELECT 
+            COUNT(*) as total_days,
+            MAX(date) as latest_date,
+            MIN(date) as earliest_date
+        FROM daily_health_summary
+    """)
+    
+    total_days, latest_date, earliest_date = result
+    print(f"Data quality check results:")
+    print(f"  Total days: {total_days}")
+    print(f"  Date range: {earliest_date} to {latest_date}")
+    
+    # Check for data anomalies
+    anomalies = hook.get_first("""
+        SELECT COUNT(*) 
+        FROM daily_health_summary 
+        WHERE calories_intake < 500 OR calories_intake > 5000
+    """)
+    
+    if anomalies[0] > 0:
+        print(f"  WARNING: {anomalies[0]} days with unusual calorie intake")
+    
+    return total_days
+
+
+# Create the DAG
+with DAG(
+    'health_data_pipeline',
+    default_args=default_args,
+    description='ETL pipeline for MyFitnessPal and Garmin health data',
+    schedule_interval=None,
+    catchup=False,
+    tags=['health', 'etl', 'personal'],
+) as dag:
+    
+    # Create tables if they don't exist
+    create_tables = PostgresOperator(
+        task_id='create_tables',
+        postgres_conn_id='health_db',
+        sql="""
+            CREATE TABLE IF NOT EXISTS daily_health_summary (
+                date DATE PRIMARY KEY,
+                calories_intake FLOAT,
+                "Fat (g)" FLOAT,
+                "Carbohydrates (g)" FLOAT,
+                "Protein (g)" FLOAT,
+                "Fiber" FLOAT,
+                "Sugar" FLOAT,
+                "Sodium (mg)" FLOAT,
+                meal_count INTEGER,
+                calories_burned FLOAT,
+                distance FLOAT,
+                steps FLOAT,
+                activity_count INTEGER,
+                net_calories FLOAT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+            
+            CREATE INDEX IF NOT EXISTS idx_daily_health_date 
+            ON daily_health_summary(date DESC);
+        """
+    )
+    
+    # Extract tasks
+    extract_nutrition = PythonOperator(
+        task_id='extract_nutrition',
+        python_callable=extract_nutrition_data,
+    )
+    
+    extract_activities = PythonOperator(
+        task_id='extract_activities',
+        python_callable=extract_activity_data,
+    )
+    
+    # Transform tasks
+    transform_nutrition = PythonOperator(
+        task_id='transform_nutrition',
+        python_callable=transform_nutrition_data,
+    )
+    
+    transform_activities = PythonOperator(
+        task_id='transform_activities',
+        python_callable=transform_activity_data,
+    )
+    
+    # Load task
+    load_data = PythonOperator(
+        task_id='load_daily_summaries',
+        python_callable=load_daily_summaries,
+    )
+    
+    # Quality check
+    quality_check = PythonOperator(
+        task_id='data_quality_check',
+        python_callable=check_data_quality,
+    )
+    
+    # Define task dependencies
+    create_tables >> [extract_nutrition, extract_activities]
+    extract_nutrition >> transform_nutrition
+    extract_activities >> transform_activities
+    [transform_nutrition, transform_activities] >> load_data
+    load_data >> quality_check

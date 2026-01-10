@@ -36,5 +36,8 @@ export AIRFLOW_HOME="$PROJECT_DIR/airflow_home"
 export AIRFLOW__CORE__DAGS_FOLDER="$PROJECT_DIR/dags"
 export AIRFLOW__CORE__PLUGINS_FOLDER="$PROJECT_DIR/plugins"
 
+# Customize prompt to show (.venv)
+export PS1="(.venv) \[\e[32m\]\u@\h\[\e[0m\]:\[\e[34m\]\w\[\e[0m\]\$ "
+
 # Run command or start shell
 exec "${@:-bash}"
