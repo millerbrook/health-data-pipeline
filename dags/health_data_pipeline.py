@@ -193,6 +193,10 @@ def transform_nutrition_data(**context):
     daily_nutrition = df.groupby('Date').agg({
         'Calories': 'sum',
         'Fat (g)': 'sum',
+        'Saturated Fat': 'sum',
+        'Polyunsaturated Fat': 'sum',
+        'Monounsaturated Fat': 'sum',
+        'Cholesterol': 'sum',
         'Carbohydrates (g)': 'sum',
         'Protein (g)': 'sum',
         'Fiber': 'sum',
@@ -290,19 +294,30 @@ def load_daily_summaries(**context):
     inserted = 0
     updated = 0
     
+    # Helper function to convert NaN to None for SQL NULL compatibility
+    def clean_value(val):
+        if pd.isna(val):
+            return None
+        return val
+    
     for _, row in daily_summary.iterrows():
         result = hook.run("""
             INSERT INTO daily_health_summary (
-                date, calories_intake, "Fat (g)", "Carbohydrates (g)", 
-                "Protein (g)", "Fiber", "Sugar", "Sodium (mg)",
+                date, calories_intake, "Fat (g)", "Saturated Fat", 
+                "Polyunsaturated Fat", "Monounsaturated Fat", "Cholesterol",
+                "Carbohydrates (g)", "Protein (g)", "Fiber", "Sugar", "Sodium (mg)",
                 meal_count, calories_burned, distance, steps, 
                 activity_count, net_calories
             ) VALUES (
-                %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
+                %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
             )
             ON CONFLICT (date) DO UPDATE SET
                 calories_intake = EXCLUDED.calories_intake,
                 "Fat (g)" = EXCLUDED."Fat (g)",
+                "Saturated Fat" = EXCLUDED."Saturated Fat",
+                "Polyunsaturated Fat" = EXCLUDED."Polyunsaturated Fat",
+                "Monounsaturated Fat" = EXCLUDED."Monounsaturated Fat",
+                "Cholesterol" = EXCLUDED."Cholesterol",
                 "Carbohydrates (g)" = EXCLUDED."Carbohydrates (g)",
                 "Protein (g)" = EXCLUDED."Protein (g)",
                 "Fiber" = EXCLUDED."Fiber",
@@ -318,19 +333,23 @@ def load_daily_summaries(**context):
             RETURNING (xmax = 0) AS inserted;
         """, parameters=(
             row['date_str'],
-            row.get('calories_intake'),
-            row.get('Fat (g)'),
-            row.get('Carbohydrates (g)'),
-            row.get('Protein (g)'),
-            row.get('Fiber'),
-            row.get('Sugar'),
-            row.get('Sodium (mg)'),
-            row.get('meal_count'),
-            row.get('calories_burned'),
-            row.get('distance'),
-            row.get('steps'),
-            row.get('activity_count'),
-            row.get('net_calories'),
+            clean_value(row.get('calories_intake')),
+            clean_value(row.get('Fat (g)')),
+            clean_value(row.get('Saturated Fat')),
+            clean_value(row.get('Polyunsaturated Fat')),
+            clean_value(row.get('Monounsaturated Fat')),
+            clean_value(row.get('Cholesterol')),
+            clean_value(row.get('Carbohydrates (g)')),
+            clean_value(row.get('Protein (g)')),
+            clean_value(row.get('Fiber')),
+            clean_value(row.get('Sugar')),
+            clean_value(row.get('Sodium (mg)')),
+            clean_value(row.get('meal_count')),
+            clean_value(row.get('calories_burned')),
+            clean_value(row.get('distance')),
+            clean_value(row.get('steps')),
+            clean_value(row.get('activity_count')),
+            clean_value(row.get('net_calories')),
         ), handler=lambda cur: cur.fetchone())
         
         if result and result[0]:
@@ -389,19 +408,23 @@ with DAG(
         sql="""
             CREATE TABLE IF NOT EXISTS daily_health_summary (
                 date DATE PRIMARY KEY,
-                calories_intake FLOAT,
+                calories_intake INTEGER,
                 "Fat (g)" FLOAT,
+                "Saturated Fat" FLOAT,
+                "Polyunsaturated Fat" FLOAT,
+                "Monounsaturated Fat" FLOAT,
+                "Cholesterol" FLOAT,
                 "Carbohydrates (g)" FLOAT,
                 "Protein (g)" FLOAT,
                 "Fiber" FLOAT,
                 "Sugar" FLOAT,
                 "Sodium (mg)" FLOAT,
                 meal_count INTEGER,
-                calories_burned FLOAT,
+                calories_burned INTEGER,
                 distance FLOAT,
-                steps FLOAT,
+                steps INTEGER,
                 activity_count INTEGER,
-                net_calories FLOAT,
+                net_calories INTEGER,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
             
