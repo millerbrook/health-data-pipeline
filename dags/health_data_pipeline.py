@@ -41,6 +41,7 @@ def task_success_alert(context):
 PROJECT_DIR = Path(__file__).parent.parent
 MYFITNESSPAL_DIR = PROJECT_DIR / "data" / "exports" / "myfitnesspal"
 GARMIN_DIR = PROJECT_DIR / "data" / "exports" / "garmin"
+FITINDEX_DIR = PROJECT_DIR / "data" / "exports" / "fitindex"
 PROCESSED_DIR = PROJECT_DIR / "data" / "processed"
 PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -184,6 +185,71 @@ def extract_activity_data(**context):
         print(f"❌ Unexpected Error in extract_activity_data: {type(e).__name__}: {e}")
         raise
 
+def extract_fitindex_data(**context):
+    """Extract FitIndex body composition data from CSV."""
+    try:
+        csv_files = list(FITINDEX_DIR.glob("*.csv"))
+        
+        if not csv_files:
+            raise FileNotFoundError(f"No FitIndex CSV files found in {FITINDEX_DIR}")
+        
+        # Get the most recent file
+        latest_file = max(csv_files, key=lambda p: p.stat().st_mtime)
+        print(f"Processing FitIndex file: {latest_file}")
+        
+        # Read CSV
+        df = pd.read_csv(latest_file)
+        
+        # Validate required columns exist
+        required_cols = ['Time of Measurement', 'Weight(lb)', 'BMI', 'Body Fat(%)']
+        missing_cols = [col for col in required_cols if col not in df.columns]
+        if missing_cols:
+            raise ValueError(f"Missing required columns: {missing_cols}. Found columns: {df.columns.tolist()}")
+        
+        # Parse the date/time column (format: "January 31, 2026 6:32:52 AM")
+        df['Date'] = pd.to_datetime(df['Time of Measurement'], errors='coerce')
+        
+        # Check for invalid dates
+        invalid_dates = df['Date'].isna().sum()
+        if invalid_dates > 0:
+            print(f"⚠️  WARNING: Found {invalid_dates} rows with invalid dates (will be skipped)")
+            df = df.dropna(subset=['Date'])
+        
+        if len(df) == 0:
+            raise ValueError("No valid data after date parsing")
+        
+        # Extract just the date (ignore time) since we want one measurement per day
+        df['Date'] = df['Date'].dt.date
+        
+        # If multiple measurements per day, keep the latest one
+        df = df.sort_values('Time of Measurement').drop_duplicates(subset=['Date'], keep='last')
+        
+        # Data quality checks
+        print(f"Loaded {len(df)} body composition records")
+        print(f"Date range: {df['Date'].min()} to {df['Date'].max()}")
+        print(f"Weight range: {df['Weight(lb)'].min():.1f} - {df['Weight(lb)'].max():.1f} lbs")
+        
+        # Store in XCom for next task
+        output_path = PROCESSED_DIR / f"fitindex_{datetime.now().strftime('%Y%m%d_%H%M%S')}.parquet"
+        df.to_parquet(output_path, index=False)
+        context['ti'].xcom_push(key='fitindex_file', value=str(output_path))
+        
+        return len(df)
+        
+    except FileNotFoundError as e:
+        print(f"❌ File Error: {e}")
+        raise
+    except pd.errors.ParserError as e:
+        print(f"❌ CSV Parsing Error: {e}")
+        print(f"File may be corrupted or wrong format: {latest_file}")
+        raise
+    except ValueError as e:
+        print(f"❌ Validation Error: {e}")
+        raise
+    except Exception as e:
+        print(f"❌ Unexpected Error in extract_fitindex_data: {type(e).__name__}: {e}")
+        raise
+
 def transform_nutrition_data(**context):
     """Aggregate nutrition data by day."""
     nutrition_file = context['ti'].xcom_pull(task_ids='extract_nutrition', key='nutrition_file')
@@ -208,6 +274,22 @@ def transform_nutrition_data(**context):
     meal_counts = df.groupby('Date')['Meal'].count().rename('meal_count')
     daily_nutrition = daily_nutrition.merge(meal_counts, on='Date', how='left')
     
+    # Rename columns to match database schema (snake_case)
+    daily_nutrition = daily_nutrition.rename(columns={
+        'Date': 'date',
+        'Calories': 'calories',
+        'Fat (g)': 'fat_g',
+        'Saturated Fat': 'saturated_fat',
+        'Polyunsaturated Fat': 'polyunsaturated_fat',
+        'Monounsaturated Fat': 'monounsaturated_fat',
+        'Cholesterol': 'cholesterol',
+        'Carbohydrates (g)': 'carbohydrates_g',
+        'Protein (g)': 'protein_g',
+        'Fiber': 'fiber',
+        'Sugar': 'sugar',
+        'Sodium (mg)': 'sodium_mg',
+    })
+    
     print(f"Aggregated {len(daily_nutrition)} daily nutrition summaries")
     print(daily_nutrition.head())
     
@@ -217,7 +299,6 @@ def transform_nutrition_data(**context):
     context['ti'].xcom_push(key='daily_nutrition_file', value=str(output_path))
     
     return len(daily_nutrition)
-
 
 def transform_activity_data(**context):
     """Aggregate activity data by day."""
@@ -243,6 +324,14 @@ def transform_activity_data(**context):
     activity_counts = df.groupby('Date')['Activity Type'].count().rename('activity_count')
     activity_summary = activity_summary.merge(activity_counts, on='Date', how='left')
     
+    # Rename columns to match database schema (snake_case)
+    activity_summary = activity_summary.rename(columns={
+        'Date': 'date',
+        'Calories': 'calories_burned',
+        'Distance': 'distance',
+        'Steps': 'steps',
+    })
+    
     print(f"Aggregated {len(activity_summary)} daily activity summaries")
     print(activity_summary.head())
     
@@ -253,44 +342,70 @@ def transform_activity_data(**context):
     
     return len(activity_summary)
 
+def transform_fitindex_data(**context):
+    """Transform FitIndex body composition data for loading."""
+    fitindex_file = context['ti'].xcom_pull(task_ids='extract_fitindex', key='fitindex_file')
+    df = pd.read_parquet(fitindex_file)
+    
+    # Rename columns to match database schema (snake_case, no special chars)
+    column_mapping = {
+        'Date': 'date',
+        'Weight(lb)': 'weight_lb',
+        'BMI': 'bmi',
+        'Body Fat(%)': 'body_fat_pct',
+        'Fat-free Body Weight(lb)': 'fat_free_body_weight_lb',
+        'Subcutaneous Fat(%)': 'subcutaneous_fat_pct',
+        'Visceral Fat': 'visceral_fat',
+        'Body Water(%)': 'body_water_pct',
+        'Skeletal Muscle(%)': 'skeletal_muscle_pct',
+        'Muscle Mass(lb)': 'muscle_mass_lb',
+        'Bone Mass(lb)': 'bone_mass_lb',
+        'Protein(%)': 'protein_pct',
+        'BMR(kcal)': 'bmr_kcal',
+        'Metabolic Age': 'metabolic_age',
+    }
+    
+    df = df.rename(columns=column_mapping)
+    
+    # Select only the columns we need (drop Time of Measurement, Remarks)
+    columns_to_keep = list(column_mapping.values())
+    df = df[columns_to_keep]
+    
+    # Data validation
+    # Check for reasonable weight values
+    if (df['weight_lb'] < 140).any() or (df['weight_lb'] > 300).any():
+        print("⚠️  WARNING: Found unusual weight values")
+        print(df[['date', 'weight_lb']][(df['weight_lb'] < 140) | (df['weight_lb'] > 300)])
+    
+    # Check for reasonable body fat percentages
+    if (df['body_fat_pct'] < 3).any() or (df['body_fat_pct'] > 25).any():
+        print("⚠️  WARNING: Found unusual body fat percentages")
+        print(df[['date', 'body_fat_pct']][(df['body_fat_pct'] < 3) | (df['body_fat_pct'] > 25)])
+    
+    print(f"Transformed {len(df)} body composition records")
+    print(df.head())
+    
+    # Store for loading
+    output_path = PROCESSED_DIR / f"daily_body_composition_{datetime.now().strftime('%Y%m%d_%H%M%S')}.parquet"
+    df.to_parquet(output_path, index=False)
+    context['ti'].xcom_push(key='daily_body_composition_file', value=str(output_path))
+    
+    return len(df)
 
-def load_daily_summaries(**context):
-    """Load daily nutrition and activity summaries into PostgreSQL."""
+def load_nutrition(**context):
+    """Load nutrition data into PostgreSQL."""
     nutrition_file = context['ti'].xcom_pull(task_ids='transform_nutrition', key='daily_nutrition_file')
-    activity_file = context['ti'].xcom_pull(task_ids='transform_activities', key='daily_activity_file')
+    df = pd.read_parquet(nutrition_file)
     
-    nutrition_df = pd.read_parquet(nutrition_file)
-    activity_df = pd.read_parquet(activity_file)
+    print(f"Loading {len(df)} nutrition records")
     
-    # Merge on date
-    daily_summary = nutrition_df.merge(
-        activity_df,
-        on='Date',
-        how='outer',
-        suffixes=('_nutrition', '_activity')
-    )
-    
-    # Calculate net calories (intake - burned)
-    daily_summary = daily_summary.rename(columns={
-        'Calories_nutrition': 'calories_intake',
-        'Calories_activity': 'calories_burned',
-    })
-    
-    daily_summary['net_calories'] = (
-        daily_summary['calories_intake'].fillna(0) - 
-        daily_summary['calories_burned'].fillna(0)
-    )
-    
-    print(f"Merged daily summary: {len(daily_summary)} days")
-    print(daily_summary.head())
-    
-    # Load to PostgreSQL with UPSERT logic
+    # Connect to PostgreSQL
     hook = PostgresHook(postgres_conn_id='health_db')
     
     # Convert date to string for PostgreSQL
-    daily_summary['date_str'] = daily_summary['Date'].dt.strftime('%Y-%m-%d')
+    df['date_str'] = pd.to_datetime(df['date']).dt.strftime('%Y-%m-%d')
     
-    # Insert row by row with ON CONFLICT handling
+    # Track inserts vs updates
     inserted = 0
     updated = 0
     
@@ -300,56 +415,45 @@ def load_daily_summaries(**context):
             return None
         return val
     
-    for _, row in daily_summary.iterrows():
+    # Insert row by row with UPSERT logic
+    for _, row in df.iterrows():
         result = hook.run("""
-            INSERT INTO daily_health_summary (
-                date, calories_intake, "Fat (g)", "Saturated Fat", 
-                "Polyunsaturated Fat", "Monounsaturated Fat", "Cholesterol",
-                "Carbohydrates (g)", "Protein (g)", "Fiber", "Sugar", "Sodium (mg)",
-                meal_count, calories_burned, distance, steps, 
-                activity_count, net_calories
+            INSERT INTO nutrition_daily (
+                date, calories, fat_g, saturated_fat, polyunsaturated_fat,
+                monounsaturated_fat, cholesterol, carbohydrates_g, protein_g,
+                fiber, sugar, sodium_mg, meal_count
             ) VALUES (
-                %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
+                %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
             )
             ON CONFLICT (date) DO UPDATE SET
-                calories_intake = EXCLUDED.calories_intake,
-                "Fat (g)" = EXCLUDED."Fat (g)",
-                "Saturated Fat" = EXCLUDED."Saturated Fat",
-                "Polyunsaturated Fat" = EXCLUDED."Polyunsaturated Fat",
-                "Monounsaturated Fat" = EXCLUDED."Monounsaturated Fat",
-                "Cholesterol" = EXCLUDED."Cholesterol",
-                "Carbohydrates (g)" = EXCLUDED."Carbohydrates (g)",
-                "Protein (g)" = EXCLUDED."Protein (g)",
-                "Fiber" = EXCLUDED."Fiber",
-                "Sugar" = EXCLUDED."Sugar",
-                "Sodium (mg)" = EXCLUDED."Sodium (mg)",
+                calories = EXCLUDED.calories,
+                fat_g = EXCLUDED.fat_g,
+                saturated_fat = EXCLUDED.saturated_fat,
+                polyunsaturated_fat = EXCLUDED.polyunsaturated_fat,
+                monounsaturated_fat = EXCLUDED.monounsaturated_fat,
+                cholesterol = EXCLUDED.cholesterol,
+                carbohydrates_g = EXCLUDED.carbohydrates_g,
+                protein_g = EXCLUDED.protein_g,
+                fiber = EXCLUDED.fiber,
+                sugar = EXCLUDED.sugar,
+                sodium_mg = EXCLUDED.sodium_mg,
                 meal_count = EXCLUDED.meal_count,
-                calories_burned = EXCLUDED.calories_burned,
-                distance = EXCLUDED.distance,
-                steps = EXCLUDED.steps,
-                activity_count = EXCLUDED.activity_count,
-                net_calories = EXCLUDED.net_calories,
                 created_at = CURRENT_TIMESTAMP
             RETURNING (xmax = 0) AS inserted;
         """, parameters=(
             row['date_str'],
-            clean_value(row.get('calories_intake')),
-            clean_value(row.get('Fat (g)')),
-            clean_value(row.get('Saturated Fat')),
-            clean_value(row.get('Polyunsaturated Fat')),
-            clean_value(row.get('Monounsaturated Fat')),
-            clean_value(row.get('Cholesterol')),
-            clean_value(row.get('Carbohydrates (g)')),
-            clean_value(row.get('Protein (g)')),
-            clean_value(row.get('Fiber')),
-            clean_value(row.get('Sugar')),
-            clean_value(row.get('Sodium (mg)')),
+            clean_value(row.get('calories')),
+            clean_value(row.get('fat_g')),
+            clean_value(row.get('saturated_fat')),
+            clean_value(row.get('polyunsaturated_fat')),
+            clean_value(row.get('monounsaturated_fat')),
+            clean_value(row.get('cholesterol')),
+            clean_value(row.get('carbohydrates_g')),
+            clean_value(row.get('protein_g')),
+            clean_value(row.get('fiber')),
+            clean_value(row.get('sugar')),
+            clean_value(row.get('sodium_mg')),
             clean_value(row.get('meal_count')),
-            clean_value(row.get('calories_burned')),
-            clean_value(row.get('distance')),
-            clean_value(row.get('steps')),
-            clean_value(row.get('activity_count')),
-            clean_value(row.get('net_calories')),
         ), handler=lambda cur: cur.fetchone())
         
         if result and result[0]:
@@ -357,82 +461,273 @@ def load_daily_summaries(**context):
         else:
             updated += 1
     
-    print(f"Loaded {inserted} new records, updated {updated} existing records")
+    print(f"Loaded {inserted} new nutrition records, updated {updated} existing records")
+    return {'inserted': inserted, 'updated': updated}
+
+def load_activities(**context):
+    """Load activity data into PostgreSQL."""
+    activity_file = context['ti'].xcom_pull(task_ids='transform_activities', key='daily_activity_file')
+    df = pd.read_parquet(activity_file)
+    
+    print(f"Loading {len(df)} activity records")
+    
+    # Connect to PostgreSQL
+    hook = PostgresHook(postgres_conn_id='health_db')
+    
+    # Convert date to string for PostgreSQL
+    df['date_str'] = pd.to_datetime(df['date']).dt.strftime('%Y-%m-%d')
+    
+    # Track inserts vs updates
+    inserted = 0
+    updated = 0
+    
+    # Helper function to convert NaN to None for SQL NULL compatibility
+    def clean_value(val):
+        if pd.isna(val):
+            return None
+        return val
+    
+    # Insert row by row with UPSERT logic
+    for _, row in df.iterrows():
+        result = hook.run("""
+            INSERT INTO activity_daily (
+                date, calories_burned, distance, steps, activity_count
+            ) VALUES (
+                %s, %s, %s, %s, %s
+            )
+            ON CONFLICT (date) DO UPDATE SET
+                calories_burned = EXCLUDED.calories_burned,
+                distance = EXCLUDED.distance,
+                steps = EXCLUDED.steps,
+                activity_count = EXCLUDED.activity_count,
+                created_at = CURRENT_TIMESTAMP
+            RETURNING (xmax = 0) AS inserted;
+        """, parameters=(
+            row['date_str'],
+            clean_value(row.get('calories_burned')),
+            clean_value(row.get('distance')),
+            clean_value(row.get('steps')),
+            clean_value(row.get('activity_count')),
+        ), handler=lambda cur: cur.fetchone())
+        
+        if result and result[0]:
+            inserted += 1
+        else:
+            updated += 1
+    
+    print(f"Loaded {inserted} new activity records, updated {updated} existing records")
+    return {'inserted': inserted, 'updated': updated}
+
+def load_body_composition(**context):
+    """Load body composition data into PostgreSQL."""
+    body_comp_file = context['ti'].xcom_pull(task_ids='transform_fitindex', key='daily_body_composition_file')
+    df = pd.read_parquet(body_comp_file)
+    
+    print(f"Loading {len(df)} body composition records")
+    
+    # Connect to PostgreSQL
+    hook = PostgresHook(postgres_conn_id='health_db')
+    
+    # Convert date to string for PostgreSQL
+    df['date_str'] = pd.to_datetime(df['date']).dt.strftime('%Y-%m-%d')
+    
+    # Track inserts vs updates
+    inserted = 0
+    updated = 0
+    
+    # Helper function to convert NaN to None for SQL NULL compatibility
+    def clean_value(val):
+        if pd.isna(val):
+            return None
+        return val
+    
+    # Insert row by row with UPSERT logic
+    for _, row in df.iterrows():
+        result = hook.run("""
+            INSERT INTO body_composition (
+                date, weight_lb, bmi, body_fat_pct, fat_free_body_weight_lb,
+                subcutaneous_fat_pct, visceral_fat, body_water_pct, 
+                skeletal_muscle_pct, muscle_mass_lb, bone_mass_lb, 
+                protein_pct, bmr_kcal, metabolic_age
+            ) VALUES (
+                %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
+            )
+            ON CONFLICT (date) DO UPDATE SET
+                weight_lb = EXCLUDED.weight_lb,
+                bmi = EXCLUDED.bmi,
+                body_fat_pct = EXCLUDED.body_fat_pct,
+                fat_free_body_weight_lb = EXCLUDED.fat_free_body_weight_lb,
+                subcutaneous_fat_pct = EXCLUDED.subcutaneous_fat_pct,
+                visceral_fat = EXCLUDED.visceral_fat,
+                body_water_pct = EXCLUDED.body_water_pct,
+                skeletal_muscle_pct = EXCLUDED.skeletal_muscle_pct,
+                muscle_mass_lb = EXCLUDED.muscle_mass_lb,
+                bone_mass_lb = EXCLUDED.bone_mass_lb,
+                protein_pct = EXCLUDED.protein_pct,
+                bmr_kcal = EXCLUDED.bmr_kcal,
+                metabolic_age = EXCLUDED.metabolic_age,
+                created_at = CURRENT_TIMESTAMP
+            RETURNING (xmax = 0) AS inserted;
+        """, parameters=(
+            row['date_str'],
+            clean_value(row.get('weight_lb')),
+            clean_value(row.get('bmi')),
+            clean_value(row.get('body_fat_pct')),
+            clean_value(row.get('fat_free_body_weight_lb')),
+            clean_value(row.get('subcutaneous_fat_pct')),
+            clean_value(row.get('visceral_fat')),
+            clean_value(row.get('body_water_pct')),
+            clean_value(row.get('skeletal_muscle_pct')),
+            clean_value(row.get('muscle_mass_lb')),
+            clean_value(row.get('bone_mass_lb')),
+            clean_value(row.get('protein_pct')),
+            clean_value(row.get('bmr_kcal')),
+            clean_value(row.get('metabolic_age')),
+        ), handler=lambda cur: cur.fetchone())
+        
+        if result and result[0]:
+            inserted += 1
+        else:
+            updated += 1
+    
+    print(f"Loaded {inserted} new body composition records, updated {updated} existing records")
     return {'inserted': inserted, 'updated': updated}
 
 def check_data_quality(**context):
     """Run data quality checks on the processed data."""
     hook = PostgresHook(postgres_conn_id='health_db')
     
-    # Check for recent data
-    result = hook.get_first("""
+    # Check nutrition data
+    nutrition_result = hook.get_first("""
         SELECT 
             COUNT(*) as total_days,
             MAX(date) as latest_date,
             MIN(date) as earliest_date
-        FROM daily_health_summary
+        FROM nutrition_daily
     """)
     
-    total_days, latest_date, earliest_date = result
-    print(f"Data quality check results:")
-    print(f"  Total days: {total_days}")
-    print(f"  Date range: {earliest_date} to {latest_date}")
+    if nutrition_result:
+        total_days, latest_date, earliest_date = nutrition_result
+        print(f"Nutrition data quality check:")
+        print(f"  Total days: {total_days}")
+        print(f"  Date range: {earliest_date} to {latest_date}")
+        
+        # Check for anomalies
+        anomalies = hook.get_first("""
+            SELECT COUNT(*) 
+            FROM nutrition_daily 
+            WHERE calories < 500 OR calories > 5000
+        """)
+        
+        if anomalies[0] > 0:
+            print(f"  ⚠️  WARNING: {anomalies[0]} days with unusual calorie intake")
     
-    # Check for data anomalies
-    anomalies = hook.get_first("""
-        SELECT COUNT(*) 
-        FROM daily_health_summary 
-        WHERE calories_intake < 500 OR calories_intake > 5000
+    # Check activity data
+    activity_result = hook.get_first("""
+        SELECT 
+            COUNT(*) as total_days,
+            MAX(date) as latest_date,
+            MIN(date) as earliest_date
+        FROM activity_daily
     """)
     
-    if anomalies[0] > 0:
-        print(f"  WARNING: {anomalies[0]} days with unusual calorie intake")
+    if activity_result:
+        total_days, latest_date, earliest_date = activity_result
+        print(f"Activity data quality check:")
+        print(f"  Total days: {total_days}")
+        print(f"  Date range: {earliest_date} to {latest_date}")
     
-    return total_days
-
+    # Check body composition data
+    body_result = hook.get_first("""
+        SELECT 
+            COUNT(*) as total_days,
+            MAX(date) as latest_date,
+            MIN(date) as earliest_date
+        FROM body_composition
+    """)
+    
+    if body_result:
+        total_days, latest_date, earliest_date = body_result
+        print(f"Body composition data quality check:")
+        print(f"  Total days: {total_days}")
+        print(f"  Date range: {earliest_date} to {latest_date}")
+    
+    return True
 
 # Create the DAG
 with DAG(
     'health_data_pipeline',
     default_args=default_args,
-    description='ETL pipeline for MyFitnessPal and Garmin health data',
+    description='ETL pipeline for MyFitnessPal, Garmin, and FitIndex health data',
     schedule_interval=None,
     catchup=False,
     tags=['health', 'etl', 'personal'],
 ) as dag:
     
-    # Create tables if they don't exist
     create_tables = PostgresOperator(
-        task_id='create_tables',
-        postgres_conn_id='health_db',
-        sql="""
-            CREATE TABLE IF NOT EXISTS daily_health_summary (
-                date DATE PRIMARY KEY,
-                calories_intake INTEGER,
-                "Fat (g)" FLOAT,
-                "Saturated Fat" FLOAT,
-                "Polyunsaturated Fat" FLOAT,
-                "Monounsaturated Fat" FLOAT,
-                "Cholesterol" FLOAT,
-                "Carbohydrates (g)" FLOAT,
-                "Protein (g)" FLOAT,
-                "Fiber" FLOAT,
-                "Sugar" FLOAT,
-                "Sodium (mg)" FLOAT,
-                meal_count INTEGER,
-                calories_burned INTEGER,
-                distance FLOAT,
-                steps INTEGER,
-                activity_count INTEGER,
-                net_calories INTEGER,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            );
-            
-            CREATE INDEX IF NOT EXISTS idx_daily_health_date 
-            ON daily_health_summary(date DESC);
-        """
-    )
-    
+    task_id='create_tables',
+    postgres_conn_id='health_db',
+    sql="""
+        -- Drop old merged table (clean migration)
+        DROP TABLE IF EXISTS daily_health_summary;
+        
+        -- Nutrition data table
+        CREATE TABLE IF NOT EXISTS nutrition_daily (
+            date DATE PRIMARY KEY,
+            calories INTEGER,
+            fat_g FLOAT,
+            saturated_fat FLOAT,
+            polyunsaturated_fat FLOAT,
+            monounsaturated_fat FLOAT,
+            cholesterol FLOAT,
+            carbohydrates_g FLOAT,
+            protein_g FLOAT,
+            fiber FLOAT,
+            sugar FLOAT,
+            sodium_mg FLOAT,
+            meal_count INTEGER,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+        
+        CREATE INDEX IF NOT EXISTS idx_nutrition_daily_date 
+        ON nutrition_daily(date DESC);
+        
+        -- Activity data table
+        CREATE TABLE IF NOT EXISTS activity_daily (
+            date DATE PRIMARY KEY,
+            calories_burned INTEGER,
+            distance FLOAT,
+            steps INTEGER,
+            activity_count INTEGER,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+        
+        CREATE INDEX IF NOT EXISTS idx_activity_daily_date 
+        ON activity_daily(date DESC);
+        
+        -- Body composition data table
+        CREATE TABLE IF NOT EXISTS body_composition (
+            date DATE PRIMARY KEY,
+            weight_lb FLOAT,
+            bmi FLOAT,
+            body_fat_pct FLOAT,
+            fat_free_body_weight_lb FLOAT,
+            subcutaneous_fat_pct FLOAT,
+            visceral_fat FLOAT,
+            body_water_pct FLOAT,
+            skeletal_muscle_pct FLOAT,
+            muscle_mass_lb FLOAT,
+            bone_mass_lb FLOAT,
+            protein_pct FLOAT,
+            bmr_kcal INTEGER,
+            metabolic_age INTEGER,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+        
+        CREATE INDEX IF NOT EXISTS idx_body_composition_date 
+        ON body_composition(date DESC);
+    """
+)
     # Extract tasks
     extract_nutrition = PythonOperator(
         task_id='extract_nutrition',
@@ -442,6 +737,11 @@ with DAG(
     extract_activities = PythonOperator(
         task_id='extract_activities',
         python_callable=extract_activity_data,
+    )
+    
+    extract_fitindex = PythonOperator(
+        task_id='extract_fitindex',
+        python_callable=extract_fitindex_data,
     )
     
     # Transform tasks
@@ -455,10 +755,25 @@ with DAG(
         python_callable=transform_activity_data,
     )
     
-    # Load task
-    load_data = PythonOperator(
-        task_id='load_daily_summaries',
-        python_callable=load_daily_summaries,
+    transform_fitindex = PythonOperator(
+        task_id='transform_fitindex',
+        python_callable=transform_fitindex_data,
+    )
+    
+    # Load tasks
+    load_nutrition_data = PythonOperator(
+        task_id='load_nutrition',
+        python_callable=load_nutrition,
+    )
+    
+    load_activity_data = PythonOperator(
+        task_id='load_activities',
+        python_callable=load_activities,
+    )
+    
+    load_body_comp = PythonOperator(
+        task_id='load_body_composition',
+        python_callable=load_body_composition,
     )
     
     # Quality check
@@ -468,8 +783,10 @@ with DAG(
     )
     
     # Define task dependencies
-    create_tables >> [extract_nutrition, extract_activities]
-    extract_nutrition >> transform_nutrition
-    extract_activities >> transform_activities
-    [transform_nutrition, transform_activities] >> load_data
-    load_data >> quality_check
+    create_tables >> [extract_nutrition, extract_activities, extract_fitindex]
+    
+    extract_nutrition >> transform_nutrition >> load_nutrition_data
+    extract_activities >> transform_activities >> load_activity_data
+    extract_fitindex >> transform_fitindex >> load_body_comp
+    
+    [load_nutrition_data, load_activity_data, load_body_comp] >> quality_check
