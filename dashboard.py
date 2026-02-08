@@ -5,6 +5,7 @@ import psycopg2
 import plotly.express as px
 # Create figure with plotly graph objects for better control
 import plotly.graph_objects as go
+import hmac
 
 # Optional scipy for trend lines
 try:
@@ -13,11 +14,37 @@ try:
 except ImportError:
     SCIPY_AVAILABLE = False
 
-# Database connection function
-@st.cache_data
-def load_data():
+# Password authentication for local development
+def check_password():
+    """Returns `True` if the user had the correct password."""
+    
+    def password_entered():
+        """Checks whether a password entered by the user is correct."""
+        # Simple local development password
+        if st.session_state["password"] == "health123":
+            st.session_state["password_correct"] = True
+            del st.session_state["password"]
+        else:
+            st.session_state["password_correct"] = False
 
+    # Return True if password already validated
+    if st.session_state.get("password_correct", False):
+        return True
+
+    # Show input for password
+    st.text_input(
+        "🔒 Enter Password", type="password", on_change=password_entered, key="password"
+    )
+    
+    if "password_correct" in st.session_state:
+        st.error("😕 Password incorrect")
+    
+    return False
+
+# Database connection function
+def load_data():
     """Load health data from PostgreSQL by joining all 3 tables."""
+    
     conn = psycopg2.connect(
         host="localhost",
         port=5433,
@@ -66,6 +93,10 @@ def load_data():
     df['date'] = pd.to_datetime(df['date'])
     
     return df
+
+# Check password before showing dashboard
+if not check_password():
+    st.stop()
 st.title("🏃 Health Dashboard")
 
 # Load data

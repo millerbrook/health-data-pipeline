@@ -726,6 +726,38 @@ with DAG(
         
         CREATE INDEX IF NOT EXISTS idx_body_composition_date 
         ON body_composition(date DESC);
+
+        -- Lab results data table
+        CREATE TABLE IF NOT EXISTS lab_results (
+            id SERIAL PRIMARY KEY,
+            test_date DATE NOT NULL,
+            panel_name VARCHAR(255) NOT NULL,
+            test_name VARCHAR(255) NOT NULL,
+            result_value FLOAT,
+            result_text VARCHAR(255),
+            result_flag VARCHAR(10),
+            result_unit VARCHAR(50),
+            reference_range_text VARCHAR(500),
+            reference_range_low FLOAT,
+            reference_range_high FLOAT,
+            is_abnormal BOOLEAN,
+            notes TEXT,
+            lab_name VARCHAR(255) DEFAULT 'Quest Diagnostics',
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(test_date, test_name)
+        );
+        
+        CREATE INDEX IF NOT EXISTS idx_lab_results_date 
+        ON lab_results(test_date DESC);
+        
+        CREATE INDEX IF NOT EXISTS idx_lab_results_panel 
+        ON lab_results(panel_name);
+        
+        CREATE INDEX IF NOT EXISTS idx_lab_results_test_name 
+        ON lab_results(test_name);
+        
+        CREATE INDEX IF NOT EXISTS idx_lab_results_abnormal 
+        ON lab_results(is_abnormal) WHERE is_abnormal = TRUE;
     """
 )
     # Extract tasks
