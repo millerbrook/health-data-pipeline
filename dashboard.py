@@ -1,3 +1,4 @@
+import os
 import streamlit as st
 from datetime import timedelta
 import pandas as pd
@@ -43,12 +44,24 @@ def check_password():
 
 # Database connection function
 def get_db_connection():
+    if "postgres" in st.secrets:
+        cfg = st.secrets["postgres"]
+        return psycopg2.connect(
+            host=cfg.get("host"),
+            port=cfg.get("port", 5432),
+            database=cfg.get("database"),
+            user=cfg.get("user"),
+            password=cfg.get("password"),
+            sslmode=cfg.get("sslmode", "require")
+        )
+
     return psycopg2.connect(
-        host="localhost",
-        port=5433,
-        database="airflow",
-        user="airflow",
-        password="airflow"
+        host=os.getenv("PGHOST", "localhost"),
+        port=int(os.getenv("PGPORT", "5433")),
+        database=os.getenv("PGDATABASE", "airflow"),
+        user=os.getenv("PGUSER", "airflow"),
+        password=os.getenv("PGPASSWORD", "airflow"),
+        sslmode=os.getenv("PGSSLMODE", "prefer")
     )
 
 def load_data():
