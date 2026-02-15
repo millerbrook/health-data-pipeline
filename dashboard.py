@@ -26,6 +26,20 @@ def check_password():
         else:
             st.session_state["password_correct"] = False
 
+    # Return True if password already validated
+    if st.session_state.get("password_correct", False):
+        return True
+
+    # Show input for password
+    st.text_input(
+        "🔒 Enter Password", type="password", on_change=password_entered, key="password"
+    )
+    
+    if "password_correct" in st.session_state:
+        st.error("😕 Password incorrect")
+    
+    return False
+
 # Database connection function
 def get_db_connection():
     if "postgres" in st.secrets:
