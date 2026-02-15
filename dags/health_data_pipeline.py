@@ -1,11 +1,17 @@
 from datetime import datetime, timedelta
 from pathlib import Path
+import sys
 import pandas as pd
 from airflow import DAG
 from airflow.operators.python import PythonOperator
 from airflow.providers.postgres.operators.postgres import PostgresOperator
 from airflow.providers.postgres.hooks.postgres import PostgresHook
 from airflow.sensors.filesystem import FileSensor
+
+# Add project root to Python path so we can import from utils
+PROJECT_ROOT = Path(__file__).parent.parent
+sys.path.insert(0, str(PROJECT_ROOT))
+from utils.lab_parser import parse_all_lab_pdfs
 
 def task_failure_alert(context):
     """Called when a task fails."""
@@ -42,6 +48,7 @@ PROJECT_DIR = Path(__file__).parent.parent
 MYFITNESSPAL_DIR = PROJECT_DIR / "data" / "exports" / "myfitnesspal"
 GARMIN_DIR = PROJECT_DIR / "data" / "exports" / "garmin"
 FITINDEX_DIR = PROJECT_DIR / "data" / "exports" / "fitindex"
+LAB_DIR = PROJECT_DIR / "data" / "exports" / "lab_results"
 PROCESSED_DIR = PROJECT_DIR / "data" / "processed"
 PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -250,6 +257,142 @@ def extract_fitindex_data(**context):
         print(f"❌ Unexpected Error in extract_fitindex_data: {type(e).__name__}: {e}")
         raise
 
+def extract_lab_results(**context):
+    """Extract lab results from PDF files using the lab_parser utility."""
+    try:
+        pdf_files = list(LAB_DIR.glob("*.pdf"))
+        
+        if not pdf_files:
+            raise FileNotFoundError(f"No lab report PDF files found in {LAB_DIR}")
+        
+        print(f"Found {len(pdf_files)} lab report PDFs to process")
+        
+        # Parse all PDFs in the lab directory
+        df = parse_all_lab_pdfs(LAB_DIR)
+        
+        if len(df) == 0:
+            raise ValueError("No lab results extracted from PDFs")
+        
+        # Data quality checks
+        print(f"Extracted {len(df)} lab test results")
+        print(f"Date range: {df['test_date'].min()} to {df['test_date'].max()}")
+        print(f"Unique tests: {df['test_name'].nunique()}")
+        print(f"Panels: {df['panel_name'].unique()}")
+        
+        # Store in XCom for next task
+        output_path = PROCESSED_DIR / f"lab_results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.parquet"
+        df.to_parquet(output_path, index=False)
+        context['ti'].xcom_push(key='lab_results_file', value=str(output_path))
+        
+        return len(df)
+        
+    except FileNotFoundError as e:
+        print(f"❌ File Error: {e}")
+        raise
+    except ValueError as e:
+        print(f"❌ Validation Error: {e}")
+        raise
+    except Exception as e:
+        print(f"❌ Unexpected Error in extract_lab_results: {type(e).__name__}: {e}")
+        raise
+
+def transform_lab_results(**context):
+    """Validate and prepare lab results for loading."""
+    lab_results_file = context['ti'].xcom_pull(task_ids='extract_lab', key='lab_results_file')
+    df = pd.read_parquet(lab_results_file)
+    
+    print(f"Transforming {len(df)} lab test results")
+    
+    # Ensure test_date is datetime
+    df['test_date'] = pd.to_datetime(df['test_date'], errors='coerce')
+    
+    # Validate required columns
+    required_cols = ['test_date', 'panel_name', 'test_name', 'is_abnormal']
+    missing_cols = [col for col in required_cols if col not in df.columns]
+    if missing_cols:
+        raise ValueError(f"Missing required columns: {missing_cols}")
+    
+    # Ensure boolean is_abnormal
+    df['is_abnormal'] = df['is_abnormal'].astype(bool)
+    
+    # Fill nulls in optional text fields
+    text_cols = ['result_text', 'result_flag', 'result_unit', 'reference_range_text', 'notes']
+    for col in text_cols:
+        if col in df.columns:
+            df[col] = df[col].fillna('')
+    
+    # Sort by test date and test name
+    df = df.sort_values(['test_date', 'test_name']).reset_index(drop=True)
+    
+    print(f"Transformed {len(df)} lab records")
+    print(f"  Abnormal results: {df['is_abnormal'].sum()}")
+    print(f"  Panels: {df['panel_name'].nunique()}")
+    print(f"  Unique tests: {df['test_name'].nunique()}")
+    
+    # Store for loading
+    output_path = PROCESSED_DIR / f"lab_results_transformed_{datetime.now().strftime('%Y%m%d_%H%M%S')}.parquet"
+    df.to_parquet(output_path, index=False)
+    context['ti'].xcom_push(key='lab_results_transformed_file', value=str(output_path))
+    
+    return len(df)
+
+def load_lab_results(**context):
+    """Load lab results into PostgreSQL."""
+    lab_results_file = context['ti'].xcom_pull(task_ids='transform_lab', key='lab_results_transformed_file')
+    df = pd.read_parquet(lab_results_file)
+    
+    print(f"Loading {len(df)} lab test results")
+    
+    # Connect to PostgreSQL
+    hook = PostgresHook(postgres_conn_id='health_db')
+    
+    # Track inserts vs updates
+    inserted = 0
+    skipped = 0  # Duplicate UNIQUE(test_date, test_name) constraint
+    
+    # Helper function to convert NaN to None for SQL NULL compatibility
+    def clean_value(val):
+        if pd.isna(val):
+            return None
+        return val
+    
+    # Insert row by row (lab_results uses UNIQUE constraint, not upsert friendly)
+    for _, row in df.iterrows():
+        try:
+            hook.run("""
+                INSERT INTO lab_results (
+                    test_date, panel_name, test_name, result_value, result_text,
+                    result_flag, result_unit, reference_range_text,
+                    reference_range_low, reference_range_high, is_abnormal, notes
+                ) VALUES (
+                    %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
+                )
+            """, parameters=(
+                row['test_date'].strftime('%Y-%m-%d') if pd.notna(row['test_date']) else None,
+                row['panel_name'],
+                row['test_name'],
+                clean_value(row.get('result_value')),
+                clean_value(row.get('result_text')),
+                clean_value(row.get('result_flag')),
+                clean_value(row.get('result_unit')),
+                clean_value(row.get('reference_range_text')),
+                clean_value(row.get('reference_range_low')),
+                clean_value(row.get('reference_range_high')),
+                row['is_abnormal'],
+                clean_value(row.get('notes')),
+            ))
+            inserted += 1
+        except Exception as e:
+            # Likely a duplicate UNIQUE constraint violation
+            if 'unique constraint' in str(e).lower():
+                skipped += 1
+            else:
+                print(f"  Error inserting {row['test_name']}: {e}")
+                skipped += 1
+    
+    print(f"Loaded {inserted} lab results, skipped {skipped} duplicates")
+    return {'inserted': inserted, 'skipped': skipped}
+
 def transform_nutrition_data(**context):
     """Aggregate nutrition data by day."""
     nutrition_file = context['ti'].xcom_pull(task_ids='extract_nutrition', key='nutrition_file')
@@ -262,12 +405,18 @@ def transform_nutrition_data(**context):
         'Saturated Fat': 'sum',
         'Polyunsaturated Fat': 'sum',
         'Monounsaturated Fat': 'sum',
+        'Trans Fat': 'sum',
         'Cholesterol': 'sum',
         'Carbohydrates (g)': 'sum',
         'Protein (g)': 'sum',
         'Fiber': 'sum',
         'Sugar': 'sum',
         'Sodium (mg)': 'sum',
+        'Potassium': 'sum',
+        'Vitamin A': 'sum',
+        'Vitamin C': 'sum',
+        'Calcium': 'sum',
+        'Iron': 'sum',
     }).reset_index()
     
     # Add meal counts
@@ -282,12 +431,18 @@ def transform_nutrition_data(**context):
         'Saturated Fat': 'saturated_fat',
         'Polyunsaturated Fat': 'polyunsaturated_fat',
         'Monounsaturated Fat': 'monounsaturated_fat',
+        'Trans Fat': 'trans_fat',
         'Cholesterol': 'cholesterol',
         'Carbohydrates (g)': 'carbohydrates_g',
         'Protein (g)': 'protein_g',
         'Fiber': 'fiber',
         'Sugar': 'sugar',
         'Sodium (mg)': 'sodium_mg',
+        'Potassium': 'potassium',
+        'Vitamin A': 'vitamin_a',
+        'Vitamin C': 'vitamin_c',
+        'Calcium': 'calcium',
+        'Iron': 'iron',
     })
     
     print(f"Aggregated {len(daily_nutrition)} daily nutrition summaries")
@@ -420,10 +575,10 @@ def load_nutrition(**context):
         result = hook.run("""
             INSERT INTO nutrition_daily (
                 date, calories, fat_g, saturated_fat, polyunsaturated_fat,
-                monounsaturated_fat, cholesterol, carbohydrates_g, protein_g,
-                fiber, sugar, sodium_mg, meal_count
+                monounsaturated_fat, trans_fat, cholesterol, carbohydrates_g, protein_g,
+                fiber, sugar, sodium_mg, potassium, vitamin_a, vitamin_c, calcium, iron, meal_count
             ) VALUES (
-                %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
+                %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
             )
             ON CONFLICT (date) DO UPDATE SET
                 calories = EXCLUDED.calories,
@@ -431,12 +586,18 @@ def load_nutrition(**context):
                 saturated_fat = EXCLUDED.saturated_fat,
                 polyunsaturated_fat = EXCLUDED.polyunsaturated_fat,
                 monounsaturated_fat = EXCLUDED.monounsaturated_fat,
+                trans_fat = EXCLUDED.trans_fat,
                 cholesterol = EXCLUDED.cholesterol,
                 carbohydrates_g = EXCLUDED.carbohydrates_g,
                 protein_g = EXCLUDED.protein_g,
                 fiber = EXCLUDED.fiber,
                 sugar = EXCLUDED.sugar,
                 sodium_mg = EXCLUDED.sodium_mg,
+                potassium = EXCLUDED.potassium,
+                vitamin_a = EXCLUDED.vitamin_a,
+                vitamin_c = EXCLUDED.vitamin_c,
+                calcium = EXCLUDED.calcium,
+                iron = EXCLUDED.iron,
                 meal_count = EXCLUDED.meal_count,
                 created_at = CURRENT_TIMESTAMP
             RETURNING (xmax = 0) AS inserted;
@@ -447,12 +608,18 @@ def load_nutrition(**context):
             clean_value(row.get('saturated_fat')),
             clean_value(row.get('polyunsaturated_fat')),
             clean_value(row.get('monounsaturated_fat')),
+            clean_value(row.get('trans_fat')),
             clean_value(row.get('cholesterol')),
             clean_value(row.get('carbohydrates_g')),
             clean_value(row.get('protein_g')),
             clean_value(row.get('fiber')),
             clean_value(row.get('sugar')),
             clean_value(row.get('sodium_mg')),
+            clean_value(row.get('potassium')),
+            clean_value(row.get('vitamin_a')),
+            clean_value(row.get('vitamin_c')),
+            clean_value(row.get('calcium')),
+            clean_value(row.get('iron')),
             clean_value(row.get('meal_count')),
         ), handler=lambda cur: cur.fetchone())
         
@@ -679,12 +846,18 @@ with DAG(
             saturated_fat FLOAT,
             polyunsaturated_fat FLOAT,
             monounsaturated_fat FLOAT,
+            trans_fat FLOAT,
             cholesterol FLOAT,
             carbohydrates_g FLOAT,
             protein_g FLOAT,
             fiber FLOAT,
             sugar FLOAT,
             sodium_mg FLOAT,
+            potassium FLOAT,
+            vitamin_a FLOAT,
+            vitamin_c FLOAT,
+            calcium FLOAT,
+            iron FLOAT,
             meal_count INTEGER,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
@@ -760,6 +933,20 @@ with DAG(
         ON lab_results(is_abnormal) WHERE is_abnormal = TRUE;
     """
 )
+
+    migrate_nutrition_schema = PostgresOperator(
+        task_id='migrate_nutrition_schema',
+        postgres_conn_id='health_db',
+        sql="""
+            ALTER TABLE nutrition_daily
+                ADD COLUMN IF NOT EXISTS trans_fat FLOAT,
+                ADD COLUMN IF NOT EXISTS potassium FLOAT,
+                ADD COLUMN IF NOT EXISTS vitamin_a FLOAT,
+                ADD COLUMN IF NOT EXISTS vitamin_c FLOAT,
+                ADD COLUMN IF NOT EXISTS calcium FLOAT,
+                ADD COLUMN IF NOT EXISTS iron FLOAT;
+        """
+    )
     # Extract tasks
     extract_nutrition = PythonOperator(
         task_id='extract_nutrition',
@@ -814,11 +1001,28 @@ with DAG(
         python_callable=check_data_quality,
     )
     
+    # Lab data extract/transform/load tasks
+    extract_lab = PythonOperator(
+        task_id='extract_lab',
+        python_callable=extract_lab_results,
+    )
+    
+    transform_lab = PythonOperator(
+        task_id='transform_lab',
+        python_callable=transform_lab_results,
+    )
+    
+    load_lab = PythonOperator(
+        task_id='load_lab',
+        python_callable=load_lab_results,
+    )
+    
     # Define task dependencies
-    create_tables >> [extract_nutrition, extract_activities, extract_fitindex]
+    create_tables >> migrate_nutrition_schema >> [extract_nutrition, extract_activities, extract_fitindex, extract_lab]
     
     extract_nutrition >> transform_nutrition >> load_nutrition_data
     extract_activities >> transform_activities >> load_activity_data
     extract_fitindex >> transform_fitindex >> load_body_comp
+    extract_lab >> transform_lab >> load_lab
     
-    [load_nutrition_data, load_activity_data, load_body_comp] >> quality_check
+    [load_nutrition_data, load_activity_data, load_body_comp, load_lab] >> quality_check

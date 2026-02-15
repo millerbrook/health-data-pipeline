@@ -42,26 +42,42 @@ def check_password():
     return False
 
 # Database connection function
-def load_data():
-    """Load health data from PostgreSQL by joining all 3 tables."""
-    
-    conn = psycopg2.connect(
+def get_db_connection():
+    return psycopg2.connect(
         host="localhost",
         port=5433,
         database="airflow",
         user="airflow",
         password="airflow"
     )
+
+def load_data():
+    """Load health data from PostgreSQL by joining all 3 tables."""
+    
+    conn = get_db_connection()
     
     query = """
         SELECT 
             COALESCE(n.date, a.date, b.date) as date,
             
-            -- Nutrition data
+            -- Nutrition data (all fields for export)
             n.calories as calories_intake,
             n.protein_g as protein,
             n.fat_g as fat,
             n.carbohydrates_g as carbs,
+            n.fiber,
+            n.sugar,
+            n.saturated_fat,
+            n.polyunsaturated_fat,
+            n.monounsaturated_fat,
+            n.trans_fat,
+            n.cholesterol,
+            n.sodium_mg,
+            n.potassium,
+            n.vitamin_a,
+            n.vitamin_c,
+            n.calcium,
+            n.iron,
             n.meal_count,
             
             -- Activity data
@@ -74,8 +90,16 @@ def load_data():
             b.weight_lb,
             b.bmi,
             b.body_fat_pct,
+            b.fat_free_body_weight_lb,
+            b.subcutaneous_fat_pct,
+            b.visceral_fat,
+            b.body_water_pct,
+            b.skeletal_muscle_pct,
             b.muscle_mass_lb,
+            b.bone_mass_lb,
+            b.protein_pct,
             b.bmr_kcal,
+            b.metabolic_age,
             
             -- Calculate net calories
             (COALESCE(n.calories, 0) - COALESCE(a.calories_burned, 0)) as net_calories
@@ -94,6 +118,75 @@ def load_data():
     
     return df
 
+def load_lab_data():
+    """Load lab results from PostgreSQL."""
+    conn = get_db_connection()
+    query = """
+        SELECT
+            test_date,
+            panel_name,
+            test_name,
+            result_value,
+            result_text,
+            result_flag,
+            result_unit,
+            reference_range_text,
+            reference_range_low,
+            reference_range_high,
+            is_abnormal,
+            notes,
+            lab_name
+        FROM lab_results
+        ORDER BY test_date ASC
+    """
+    df = pd.read_sql(query, conn)
+    conn.close()
+
+    df['test_date'] = pd.to_datetime(df['test_date'])
+    return df
+
+def create_download_dataframe(data_df):
+    """Prepare dataframe for CSV export with averages row at the end."""
+    export_df = data_df.copy()
+    
+    # Define columns to include in export (all numeric columns except date-derived)
+    numeric_cols = export_df.select_dtypes(include=['number']).columns.tolist()
+    
+    # Calculate averages for all numeric columns
+    averages = {}
+    averages['date'] = 'AVERAGE'
+    for col in numeric_cols:
+        averages[col] = export_df[col].mean()
+    
+    # Create averages row as a dataframe
+    avg_df = pd.DataFrame([averages])
+    
+    # Combine original data with averages
+    export_df = pd.concat([export_df, avg_df], ignore_index=True)
+    
+    # Format date column for export
+    export_df['date'] = export_df['date'].apply(
+        lambda x: 'AVERAGE' if x == 'AVERAGE' else (x.strftime('%Y-%m-%d') if pd.notna(x) else '')
+    )
+    
+    return export_df
+
+def get_download_csv(data_df, lab_df, start_date, end_date):
+    """Generate CSV bytes for download with health + lab sections."""
+    export_df = create_download_dataframe(data_df)
+    health_csv = export_df.to_csv(index=False)
+
+    lab_export = lab_df.copy()
+    if not lab_export.empty:
+        lab_export = lab_export.sort_values('test_date')
+        lab_export['test_date'] = lab_export['test_date'].dt.strftime('%Y-%m-%d')
+        lab_csv = lab_export.to_csv(index=False)
+        combined_csv = f"{health_csv}\n\nLAB_RESULTS\n{lab_csv}"
+    else:
+        combined_csv = f"{health_csv}\n\nLAB_RESULTS\n"
+
+    return combined_csv
+
 # Check password before showing dashboard
 if not check_password():
     st.stop()
@@ -102,6 +195,7 @@ st.title("🏃 Health Dashboard")
 # Load data
 try:
     df = load_data()
+    lab_df = load_lab_data()
     st.success(f"✅ Loaded {len(df)} days of data!")
     
     # Date filtering section
@@ -141,6 +235,9 @@ try:
     # Filter the dataframe
     filtered_df = df[(df['date'].dt.date >= start_date) & 
                      (df['date'].dt.date <= end_date)]
+
+    filtered_lab_df = lab_df[(lab_df['test_date'].dt.date >= start_date) &
+                             (lab_df['test_date'].dt.date <= end_date)].copy()
     
     # Show info about filtered data
     st.info(f"📊 Showing data from **{start_date}** to **{end_date}** ({len(filtered_df)} days)")
@@ -148,8 +245,8 @@ try:
     # Display metrics organized by category
     st.subheader("📊 Summary Metrics")
     
-    # Nutrition Metrics
-    st.markdown("**🍽️ Nutrition**")
+    # Nutrition Metrics (display only core fields)
+    st.markdown("**🍽️ Nutrition** (all nutrients available in download)")
     col1, col2, col3, col4 = st.columns(4)
     
     with col1:
@@ -178,6 +275,23 @@ try:
         st.metric(
             label="Avg Carbs (g)",
             value=f"{avg_carbs:.1f}" if pd.notna(avg_carbs) else "N/A"
+        )
+    
+    # Fiber and Sugar
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        avg_fiber = filtered_df['fiber'].mean()
+        st.metric(
+            label="Avg Fiber (g)",
+            value=f"{avg_fiber:.1f}" if pd.notna(avg_fiber) else "N/A"
+        )
+    
+    with col2:
+        avg_sugar = filtered_df['sugar'].mean()
+        st.metric(
+            label="Avg Sugar (g)",
+            value=f"{avg_sugar:.1f}" if pd.notna(avg_sugar) else "N/A"
         )
     
     # Activity Metrics
@@ -629,6 +743,110 @@ try:
                    f"{'positive' if correlation > 0 else 'negative'} correlation")
     else:
         st.warning("⚠️ Not enough weight data to show correlation analysis. Need at least 2 measurements.")
+
+    # ========== Lab Results ==========
+    st.subheader("🧪 Lab Results")
+
+    if filtered_lab_df.empty:
+        st.warning("⚠️ No lab results in the selected date range.")
+    else:
+        total_tests = len(filtered_lab_df)
+        abnormal_count = int(filtered_lab_df['is_abnormal'].sum())
+        abnormal_rate = (abnormal_count / total_tests) * 100 if total_tests else 0
+        latest_lab_date = filtered_lab_df['test_date'].max().date()
+
+        col1, col2, col3, col4 = st.columns(4)
+        with col1:
+            st.metric("Total Tests", f"{total_tests}")
+        with col2:
+            st.metric("Abnormal Tests", f"{abnormal_count}")
+        with col3:
+            st.metric("Abnormal Rate", f"{abnormal_rate:.1f}%")
+        with col4:
+            st.metric("Latest Lab Date", f"{latest_lab_date}")
+
+        panel_options = sorted(filtered_lab_df['panel_name'].dropna().unique().tolist())
+        selected_panels = st.multiselect(
+            "Filter by Panel",
+            options=panel_options,
+            default=panel_options
+        )
+
+        if selected_panels:
+            filtered_lab_df = filtered_lab_df[filtered_lab_df['panel_name'].isin(selected_panels)].copy()
+
+        test_options = sorted(filtered_lab_df['test_name'].dropna().unique().tolist())
+        default_tests = [
+            name for name in test_options
+            if any(key in name.lower() for key in ["tsh", "glucose", "chol", "ldl", "hdl", "a1c", "triglycer"])
+        ]
+        if not default_tests:
+            default_tests = test_options[:3]
+
+        selected_tests = st.multiselect(
+            "Select Tests for Trend Lines",
+            options=test_options,
+            default=default_tests
+        )
+
+        trend_df = filtered_lab_df.copy()
+        trend_df['result_value_num'] = pd.to_numeric(trend_df['result_value'], errors='coerce')
+
+        if selected_tests:
+            trend_df = trend_df[trend_df['test_name'].isin(selected_tests)].copy()
+
+        trend_df = trend_df.dropna(subset=['result_value_num'])
+
+        if trend_df.empty:
+            st.info("No numeric lab results available for the selected tests.")
+        else:
+            fig_lab_trends = px.line(
+                trend_df,
+                x='test_date',
+                y='result_value_num',
+                color='test_name',
+                markers=True,
+                title='Lab Test Trends'
+            )
+            fig_lab_trends.update_layout(
+                xaxis_title='Date',
+                yaxis_title='Result Value',
+                hovermode='x unified',
+                height=450
+            )
+            st.plotly_chart(fig_lab_trends, width='stretch')
+
+        panel_counts = filtered_lab_df['panel_name'].value_counts().reset_index()
+        panel_counts.columns = ['panel_name', 'count']
+        fig_panels = px.bar(
+            panel_counts,
+            x='panel_name',
+            y='count',
+            title='Tests by Panel'
+        )
+        fig_panels.update_layout(
+            xaxis_title='Panel',
+            yaxis_title='Test Count',
+            height=400
+        )
+        st.plotly_chart(fig_panels, width='stretch')
+
+        abnormal_df = filtered_lab_df[filtered_lab_df['is_abnormal'] == True].copy()
+        if abnormal_df.empty:
+            st.info("No abnormal results in the selected range.")
+        else:
+            abnormal_df = abnormal_df.sort_values('test_date', ascending=False)
+            abnormal_df['test_date'] = abnormal_df['test_date'].dt.strftime('%Y-%m-%d')
+            display_cols = [
+                'test_date', 'panel_name', 'test_name', 'result_value',
+                'result_unit', 'result_flag', 'reference_range_text'
+            ]
+            st.markdown("**Latest Abnormal Results**")
+            st.dataframe(
+                abnormal_df[display_cols].head(10),
+                width='stretch',
+                hide_index=True
+            )
     
     # Show first few rows to verify
     st.subheader("Preview of Your Data")
@@ -636,6 +854,18 @@ try:
     preview_df['date'] = preview_df['date'].dt.strftime('%Y-%m-%d')
 
     st.dataframe(preview_df, width='stretch', hide_index=True)
+    
+    # Download CSV with all data and averages
+    st.subheader("📥 Download Data")
+    csv_data = get_download_csv(filtered_df, filtered_lab_df, start_date, end_date)
+    st.download_button(
+        label="📊 Download Full Dataset (CSV)",
+        data=csv_data,
+        file_name=f"health_data_{start_date}_to_{end_date}.csv",
+        mime="text/csv",
+        help="Downloads all data for selected date range with averages row at the end"
+    )
+    st.caption("ℹ️ The CSV includes all nutrition fields (macros + micronutrients), activity, and body composition data with averages calculated at the bottom.")
     
 except Exception as e:
     st.error(f"❌ Error loading data: {e}")

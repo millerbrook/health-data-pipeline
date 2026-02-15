@@ -5,6 +5,10 @@ __pycache__/
 *.pyo
 uv.lock
 
+# Environment variables (never commit credentials!)
+.env
+.env.local
+
 # Airflow
 airflow_home/airflow.db
 airflow_home/logs/
@@ -19,5 +23,6 @@ data/processed/
 # OS
 .DS_Store
 Thumbs.db
+
 # Streamlit secrets
 .streamlit/secrets.toml
